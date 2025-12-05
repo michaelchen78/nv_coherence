@@ -1,0 +1,34 @@
+run_id: '3.dec.2025_first-run'  # must match the file name!
+
+model:  # supercell parameters
+  p1_conc: 7.0e-3  # P1 concentration in number P1s / number of atoms
+  size: 100  # approx length of one side of the super cell in A
+  zdir: [1,1,1]  # z direction of the NV defect
+  # other available parameters:
+  # seed: controlled by the method run_ensemble
+  # c13_conc: set at the natural abundance
+  # verbose: set at false
+
+simulator:  # simulator parameters
+  order: 2  # CCE order
+  r_bath: 1e3  # bath cutoff radius in Angstroms
+  r_dipole: 5  # cutoff of pairwise clusters in Angstroms
+  p1_hf: true  # consider P1 nuclei-electron hyperfine?
+  polarization: 0  # gamma
+  debug_hf: false  # used to turn off custom P1 HF imap for debugging
+  # other available parameters:
+  # verbose: set at false
+  # NV parameters:
+  # - nv_position: [ 0, 0, 0 ]  # central spin position
+  # - alpha: [ 0, 0, 1 ]  # NV qubit levels in Sz basis
+  # - beta: [ 0, 1, 0 ]
+
+compute:  # parameters for computing the coherence function
+  magnetic_field: [ 0, 0, 1900 ]  # G
+  time_space: [ 0.0, 2.0, 201 ]  # start, stop, step
+  cce_types: [ "conv" ]
+  pulse_id: "1"
+
+ensemble:  # ensemble parameters
+  ensemble_size: 40  # number of unique baths generated
+  average_type: 'median'  # how to average ensemble's L(t) at some t; "mean" averages, "median" finds median
