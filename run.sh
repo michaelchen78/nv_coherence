@@ -3,16 +3,16 @@
 #SBATCH --job-name=pyccempi
 #SBATCH --partition=preemptable
 #SBATCH --nodes=1
-#SBATCH --ntasks=16
+#SBATCH --ntasks=32
 #SBATCH --cpus-per-task=1
-#SBATCH --time=12:00:00
-#SBATCH --output=temp_slurm_out/sim_%j.out
-#SBATCH --error=temp_slurm_out/sim_%j.err
+#SBATCH --time=6-00:00:0
+#SBATCH --output=temp_slurm_out/run_%j.out
+#SBATCH --error=temp_slurm_out/run_%j.err
 
 # First argument is the run_id (without .yaml)
 RUN_ID="$1"
 if [ -z "$RUN_ID" ]; then
-  echo "Usage: sbatch sim.sh <run_id>"
+  echo "Usage: sbatch run.sh <run_id>"
   echo "This will use config ./config/<run_id>.yaml"
   exit 1
 fi
@@ -34,8 +34,8 @@ echo "Config file: $YAML_PATH"
 export PYTHONPYCACHEPREFIX="$SLURM_SUBMIT_DIR/temp_slurm_out/pycache_${RUN_ID}_${SLURM_JOB_ID}"
 PYCACHE_SRC="temp_slurm_out/pycache_${RUN_ID}_${SLURM_JOB_ID}"
 
-# run the python scripy sim.py
-mpirun -n "$SLURM_NTASKS" python -u sim.py "$YAML_PATH"
+# run the python scripy run.py
+mpirun -n "$SLURM_NTASKS" python -u run.py "$YAML_PATH"
 
 ##################### IF JOB ABORTED / FAILED #####################
 MPI_STATUS=$?
@@ -69,10 +69,11 @@ if [ -d "$RUN_DIR" ]; then
   # Copy with new names
   cp ./sim.py   "${COPIES_DIR}/sim-copy.py"
   cp ./model.py "${COPIES_DIR}/model-copy.py"
+  cp ./preprocessing1.py   "${COPIES_DIR}/preprocessing1-copy.py"
+  cp ./run.py "${COPIES_DIR}/run-copy.py"
   cp "$0"       "${COPIES_DIR}/${SCRIPT_STEM}-copy.sh"
 
-  echo "Copied sim.py → sim-copy.py"
-  echo "Copied model.py → model-copy.py"
+  echo "Copied scripts → {script_name}-copy.py"
   echo "Copied $0 → ${SCRIPT_STEM}-copy.sh in $COPIES_DIR"
 else
   echo "WARNING: run directory '$RUN_DIR' does not exist; skipping script copy."
@@ -84,8 +85,8 @@ if [ -d "$RUN_DIR" ]; then
   SLURM_DIR="${RUN_DIR}/slurm_output"
   mkdir -p "$SLURM_DIR"
 
-  OUT_FILE="temp_slurm_out/sim_${SLURM_JOB_ID}.out"
-  ERR_FILE="temp_slurm_out/sim_${SLURM_JOB_ID}.err"
+  OUT_FILE="temp_slurm_out/run_${SLURM_JOB_ID}.out"
+  ERR_FILE="temp_slurm_out/run_${SLURM_JOB_ID}.err"
 
   if [ -f "$OUT_FILE" ]; then
     mv "$OUT_FILE" "$SLURM_DIR/"

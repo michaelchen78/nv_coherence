@@ -1,7 +1,8 @@
 import numpy as np
 import pycce as pc
 from ase.build import bulk
-from pathlib import Path
+from sim import logger, is_root
+from mpi4py import MPI  # for debugging
 
 # Bath spin types
 #              name    spin    gyro       quadrupole (for s>1/2)
@@ -12,14 +13,21 @@ SPIN_TYPES = [('14N',  1,      1.9338,    20.44),
              ]
 D = 2.88 * 1e6 # kHz
 E = 0 # kHz
-UNIVERSAL_SEED = 8805
 
 
 # +++++++++++++++++++++++ Auxiliary functions +++++++++++++++++++++++ #
+def current_ensemble():
+    """
+    read ensemble index off the shared logger object
+    :return: ensemble index, an attribute of the logger in sim.py
+    """
+    return getattr(logger, "current_ensemble", None)
+
+
 def p1_hyperfine(atoms, on):
     """
-    Takes a BathCell with colocated P1 nuclei and electrons and returns either the hyperfine tensor or the zero matrix
-    as a Pycce InteractionMap.
+    Takes a BathCell with colocal (having the same location) P1 nuclei and electrons and returns either the hyperfine
+    tensor or the zero matrix as a Pycce InteractionMap.
     :param atoms: the BathCell
     :param on: if True, returns the hyperfine tensor; otherwise returns zero matrix
     :return: an InteractionMap
@@ -44,10 +52,11 @@ def p1_hyperfine(atoms, on):
     imap = pc.InteractionMap()
     for i, j in pairs:
         imap[i, j] = e_p1_interaction  # J_ij between bath spins i and j
+
     return imap
 
 
-def append_many(atoms, ids, label):
+def append_many_same_loc(atoms, ids, label):
     """
     Add a spin into a BathCell for every existing spin with index in some list of indices. The new spins are at the same
     locations as the existing spins.
@@ -64,10 +73,10 @@ def append_many(atoms, ids, label):
                                                  add.view(np.ndarray)]))
 
 
-def get_pulses(pulse_id):
+def get_pulse(pulse_id):
     """
-    Given some string pulse id, return the pulse sequence or number of pulses to put into Simulator.compute. See yaml
-    for details
+    Given some string pulse_id, return the pulse sequence or number of pulses to put into Simulator.compute. See yaml
+    'pulse_id' parameter for details
     :param pulse_id: the string id
     :return: the pulse sequence or number of pulses
     """
@@ -80,25 +89,23 @@ def get_pulses(pulse_id):
 
 
 # +++++++++++++++++++++++ Primary functions +++++++++++++++++++++++ #
-def get_model(model_params):
+def get_supercell(supercell_params):
     """
     Builds a supercell with an NV center and a bath of P1 nuclei and electrons. The supercell is initially generated
     with 14C's, which utilizes PyCCE's native isotopic substitution protocols. These 14Cs are then replaced with P1
     nuclei and electrons. The P1 nuclei and electrons are colocated (identical locations).
-    :param model_params: The supercell parameters. This must contain at least p1_conc and size.
+    :param supercell_params: This must contain at least p1_conc and size. See .yaml file for full details.
     :return: A PyCCE BathCell which is the supercell.
     """
     # ================= PARAMETERS (see yaml for explanations) ================= #
     # required
-    p1_conc = model_params['p1_conc']
-    size = model_params['size']
-    # optional / defaults
-    zdir = model_params.get("zdir", [1, 1, 1])
-    seed = model_params.get("seed", UNIVERSAL_SEED)
-    c13_conc = model_params.get("c13_conc", 0.011)
-    verbose = model_params.get("verbose", False)
-    run_id = model_params["run_id"]
-    base_out_dir = model_params["base_out_dir"]
+    p1_conc = supercell_params['p1_conc']
+    size = supercell_params['size']
+    # optional, defaults
+    seed = supercell_params.get("seed", None)
+    zdir = supercell_params.get("zdir", [1, 1, 1])
+    c13_conc = supercell_params.get("c13_conc", 0.011)
+    verbose = supercell_params.get("verbose", False)
 
     # ================= MAIN CODE ================= #
     # build unit cell
@@ -108,10 +115,13 @@ def get_model(model_params):
     diamond.zdir = zdir  # set z direction of the defect
 
     # generate supercell
+    if verbose and is_root():
+        logger.info(f"Ensemble {current_ensemble()} starting now:")
+        logger.info("Generating supercell: size=%s, p1_conc=%g, seed=%s", size, p1_conc, seed)
+
     atoms = diamond.gen_supercell(size, seed=seed,
                             remove=[('C', [0., 0, 0]), ('C', [0.5, 0.5, 0.5])],  # remove NV carbons IF they're there
                             add=[('14N', [0.5, 0.5, 0.5]), ])  # add NV nitrogen nuclei (electron added later)
-    print("disregard user warning about 14C unlesss Exception is thrown")
     atoms.add_type(*SPIN_TYPES)
     assert np.allclose(atoms.A, atoms.A.flat[0])  # check that there are no hyperfine or quadrupoles
     assert np.allclose(atoms.Q, atoms.Q.flat[0])
@@ -119,24 +129,25 @@ def get_model(model_params):
     # add in P1 nuclei and electrons
     mask = (atoms.N == '14C')
     idx = np.where(mask)[0]
-    atoms = append_many(atoms, idx, 'e')  # add in electrons where 14Cs are
+    atoms = append_many_same_loc(atoms, idx, 'e')  # add in electrons where 14Cs are
     idx_14n = np.where(atoms.N == '14N')[0]
-    atoms = append_many(atoms, idx_14n, 'e')  # add in electron where NV nitrogen is
+    atoms = append_many_same_loc(atoms, idx_14n, 'e')  # add in electron where NV nitrogen is
     atoms['N'][idx] = '14N'  # add in P1's by replacing the 14Cs with 14Ns
     assert '14C' not in atoms['N']  # make sure no 14Cs left
 
-    if verbose:
-        print("\nBuilt supercell.\n")
-        out_file = Path(base_out_dir + '/' + run_id) / (run_id + ".txt")
-        with out_file.open("a", encoding="utf-8") as f:
-            f.write("\nBUILT SUPERCELL:\n")
-            f.write(f"# of atoms: {len(atoms)}\n")
-            f.write(f"# of 13C: {len(atoms) - 2 * len(idx)}\n")
-            f.write(f"# of P1s: {len(idx)}\n")
-            f.write(f"atoms: {atoms}\n")
-            # for debugging 14C user warning:
-            # names = atoms['N'].astype(str)  # make sure they’re strings
-            # f.write("\nH" + " ".join(names) + "\n\n")
+    if verbose and is_root():
+        # main logs
+        logger.info("Built supercell: N_atoms=%d, N_P1=%d, N_13C=%d\n", len(atoms), len(idx), len(atoms) - 2 * len(idx))
+
+        # write atoms to a separate CSV via the run logger
+        field_names = list(atoms.dtype.names)
+        logger.save_csv(f"atoms_ens{current_ensemble()}", field_names,
+                        ([a[name] for name in field_names] for a in atoms),
+                        subdir="supercells")
+
+        # for debugging 14C user warning:
+        # names = atoms['N'].astype(str)  # make sure they’re strings
+        # logger.info("\nH" + " ".join(names) + "\n\n")
 
     return atoms
 
@@ -145,7 +156,7 @@ def get_simulator(atoms, simulator_params):
     """
     Builds a PyCCE Simulator object given a BathCell which is a supercell with an NV center and a bath of P1s.
     :param atoms: The PyCCE BathCell which is the supercell.
-    :param simulator_params: The simulator parameters. This must contain at least order, r_bath, and r_dipole.
+    :param simulator_params: This must contain at least order, r_bath, and r_dipole. See .yaml file for full details.
     :return: The PyCCE Simulator object.
     """
     # ================= PARAMETERS (see yaml for explanations) ================= #
@@ -153,7 +164,7 @@ def get_simulator(atoms, simulator_params):
     order = int(simulator_params['order'])
     r_bath = float(simulator_params['r_bath'])
     r_dipole = float(simulator_params['r_dipole'])
-    # optional / defaults
+    # optional, defaults
     p1_hf = simulator_params.get("p1_hf", True)
     polarization = simulator_params.get("polarization", 0)
     nv_position = simulator_params.get("nv_position", [ 0, 0, 0 ])
@@ -161,8 +172,6 @@ def get_simulator(atoms, simulator_params):
     beta = simulator_params.get("beta", [ 0, 1, 0 ])
     debug_hf = simulator_params.get("debug_hf", False)
     verbose = simulator_params.get("verbose", False)
-    run_id = simulator_params["run_id"]
-    base_out_dir = simulator_params["base_out_dir"]
 
     # ================= MAIN CODE ================= #
     # get NV center and imap
@@ -170,7 +179,7 @@ def get_simulator(atoms, simulator_params):
     imap = p1_hyperfine(atoms, p1_hf)  # get imap for P1 electron-nuclei hyperfine
 
     # build simulator
-    cce_params = dict(
+    calc_params = dict(
         bath=atoms,
         spin=nv,
         imap=imap,
@@ -179,8 +188,8 @@ def get_simulator(atoms, simulator_params):
         r_dipole=r_dipole
     )
     if debug_hf:
-        cce_params.pop("imap")
-    calc = pc.Simulator(**cce_params)
+        calc_params.pop("imap")
+    calc = pc.Simulator(**calc_params)
 
     # if gamma is nonzero, will polarize the 13Cs in the Simulator's bath
     if polarization != 0:
@@ -196,133 +205,71 @@ def get_simulator(atoms, simulator_params):
             dm[1, 1] = 0.5 - pol
             a.state = dm
 
-    if verbose:
-        print("\nBuilt simulator.\n")
-        out_file = Path(base_out_dir + '/' + run_id) / (run_id + ".txt")
-        with out_file.open("a", encoding="utf-8") as f:
-            f.write("\n\nBUILT SIMULATOR:\n")
-            f.write(f"{calc}\n")
+    if verbose and is_root():
+        logger.info(f"[ens num {current_ensemble()}] Built simulator:\n{calc}\n")
 
     return calc
 
 
-def run_sim(calc, compute_params):
+def run_experiment(calc, experiment_params):
     """
-    Calculates the coherence function of some PyCCE Simulator object.
+    Calculates the coherence function of some PyCCE Simulator object using some specified cce method(s).
     :param calc: The PyCCE Simulator object to run the simulations with.
-    :param compute_params: The compute parameters. This must contain at least magnetic_field, pulse_id, time_space, and
-    cce_types.
-    :return: A numpy array with 3 columns. First is conv, second is gen, third is MC. The number of rows is time_space.
-    Each element in the array is L(t) from 0 to 1.
+    :param experiment_params: This must contain at least magnetic_field, pulse_id, time_space, cce_types, and parallel.
+    See .yaml file for full details.
+    :return: a dictionary: each key is a cce_type, each value is a 1D np array of the coherence trajectory
     """
     # ================= PARAMETERS (see yaml for explanations) ================= #
     # required
-    magnetic_field = compute_params['magnetic_field']
-    pulses = get_pulses(compute_params['pulse_id'])
-    time_space = compute_params['time_space']
-    cce_types = compute_params['cce_types']
-    # optional / defaults
-    n_bath_states = compute_params.get("n_bath_states", 20)
-    verbose = compute_params.get("verbose", False)
-    run_id = compute_params["run_id"]
-    base_out_dir = compute_params["base_out_dir"]
-    parallel = compute_params.get("parallel", False)
-    parallel_states = compute_params.get("parallel_states", False)
+    magnetic_field = experiment_params['magnetic_field']
+    pulses = get_pulse(experiment_params['pulse_id'])
+    time_space = experiment_params['time_space']
+    cce_types = experiment_params['cce_types']
+    parallel = experiment_params['parallel']
+    # optional, defaults
+    n_bath_states = experiment_params.get("n_bath_states", 20)
+    verbose = experiment_params.get("verbose", False)
+    checkpoints = experiment_params.get("checkpoints", True)
 
     # ================= MAIN CODE ================= #
-    # initialize the array to be returned
-    result = np.zeros((len(time_space), 3), dtype=float)
+    # initialize the dictionary to be returned
+    results = dict()
 
     # run the simulations
     calc_params = dict(
+        quantity="coherence",
         magnetic_field=magnetic_field,
         pulses=pulses,
-        quantity="coherence",
         parallel=parallel,
-        parallel_states=parallel_states,
     )
-    if 'conv' in cce_types:  # conventional CCE
-        if verbose:
-            print("\nStarting conventional...\n")
-        l_conv = calc.compute(time_space, method='cce', as_delay=False, **calc_params)
-        result[:, 0] = np.real(l_conv)
-        if verbose:
-            print("\nFinished conventional.\n")
-            out_file = Path(base_out_dir + '/' + run_id) / (run_id + ".txt")
-            with out_file.open("a", encoding="utf-8") as f:
-                f.write(f"\nConventional coherence: {l_conv}")
-    if 'gen' in cce_types:  # generalized CCE
-        l_generalized = calc.compute(time_space, method='gcce',**calc_params)
-        result[:, 1] = np.real(l_generalized)
-        if verbose:
-            print("\nFinished generalized.\n")
-            out_file = Path(base_out_dir + '/' + run_id) / (run_id + ".txt")
-            with out_file.open("a", encoding="utf-8") as f:
-                f.write(f"\nGeneralized coherence: {l_generalized}")
-    if 'MC' in cce_types:  # generalized CCE with random sampling of bath states
-        l_generalized_mc = calc.compute(time_space, nbstates=n_bath_states, method='gcce', seed=UNIVERSAL_SEED,
-                                        **calc_params)
-        result[:, 2] = np.real(l_generalized_mc)
-        if verbose:
-            print("\nFinished generalized with MC.\n")
-            out_file = Path(base_out_dir + '/' + run_id) / (run_id + ".txt")
-            with out_file.open("a", encoding="utf-8") as f:
-                f.write(f"\nGeneralized with MC coherence: {l_generalized_mc}")
+    # rank = MPI.COMM_WORLD.Get_rank()  # used for debugging mpi
+    for cce_type in cce_types:
+        if verbose and is_root():
+            logger.info(f"\n[ens number {current_ensemble()}] Starting coherence experiment:{cce_type}.\n")
 
-    return result
+        # change settings according to cce_type
+        base, *rest = cce_type.split("_", 1)
+        if bool(rest):  # if 'mc' is included in the cce_type
+            if parallel:
+                calc_params['parallel_states'] = True
+            calc_params['nbstates'] = n_bath_states
+        if base == 'cce':
+            calc_params['method'] = 'cce'
+        elif base == 'gcce':
+            calc_params['method'] = 'gcce'
+        else: raise Exception(f"Unknown cce type: {cce_type}")
 
+        # calculate coherence and add it to results
+        coherence = calc.compute(time_space, **calc_params)
+        results[cce_type] = coherence
 
-def run_ensemble(model_params, simulator_params, compute_params, ensemble_params):
-    """
-    Runs many simulations each with a unique bath configuration. A glorified for loop of the function run_sim.
-    :param model_params: see the function get_model
-    :param simulator_params: see the function get_simulator
-    :param compute_params: see the function run_sim
-    :param ensemble_params: The ensemble parameters. This must contain at least n_runs and average_type.
-    :return: A dictionary of length 3, of 2D numpy arrays. The keys are the 3 cce_types; if a cce_type (e.g. 'MC') is
-    not in cce_types, then its value is None. The 2D arrays have shape (timesteps, ensemble_size); that is, each column
-    is one experiment, so the number of columns is the ensemble size. And the number of rows is just how many steps in
-    the time space. Each element is L(t) from 0 to 1.
-    """
-    # ================= PARAMETERS (see yaml for explanations) ================= #
-    # required
-    ensemble_size = ensemble_params['ensemble_size']
-    # optional / defaults
-    verbose = ensemble_params.get("verbose", False)
-    run_id = ensemble_params["run_id"]
-    base_out_dir = ensemble_params["base_out_dir"]
+        if verbose and is_root():
+            logger.info(f"\nRank 0 mpi process has finished coherence experiment:{cce_type}.\n")
+        if checkpoints:
+            logger.save_csv(f"coherence_{cce_type}_ens{current_ensemble()}",
+                            ["time_space", "trajectory"], ((t, y) for t, y in zip(time_space, coherence)),
+                            subdir="checkpoints",
+                            ignore_mpi=False)  # ignore_mpi=False means only root writes, this is safe since compute
+                                               # returns the full property on each process
 
-    # ================= MAIN CODE ================= #
-    results = []
-
-    for i in range(ensemble_size):
-        seed = np.random.randint(0, 2 ** 32, dtype='uint32')  # new seed each loop
-        new_model_params = dict(model_params)  # shallow copy so we can tweak per-run
-        new_model_params["seed"] = seed
-
-        supercell = get_model(new_model_params)
-        simulator = get_simulator(supercell, simulator_params)
-        coherence = run_sim(simulator, compute_params)
-        results.append(coherence)
-
-        if verbose:
-            print(f"\n\nFinished run {i+1}.")
-            out_file = Path(base_out_dir + '/' + run_id) / (run_id + ".txt")
-            with out_file.open("a", encoding="utf-8") as f:
-                f.write(f"\n\nFinished run {i+1}. More information below.\n")
-                # f.write(f"\nSupercell:{supercell}")
-                # f.write(f"\nSimulator:{simulator}")
-                # f.write(f"\nCoherence:{coherence}")
-                # f.write(f"\nModel params:{model_params}")
-                # f.write(f"\nSimulator params:{simulator_params}")
-                # f.write(f"\nCompute params:{compute_params}")
-                # f.write(f"\nEnsemble params:{ensemble_params}")
-
-    results_arr = np.stack(results, axis=2)
-    final = {
-        "conv": results_arr[:, 0, :] if "conv" in compute_params["cce_types"] else None,
-        "gen": results_arr[:, 1, :] if "gen" in compute_params["cce_types"] else None,
-        "MC": results_arr[:, 2, :] if "MC" in compute_params["cce_types"] else None,
-    }
-
-    return final
+    return results

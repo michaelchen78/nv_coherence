@@ -1,35 +1,141 @@
-from model import run_ensemble
+import sys
 import numpy as np
 import yaml
 from pathlib import Path
-from scipy.optimize import curve_fit
-import matplotlib.pyplot as plt
-from matplotlib.axes import Axes
 import time
 import copy
+import logging
+import hashlib
+import csv
+
+# +++++++++++++++++++++++ Ensemble context +++++++++++++++++++++++ #
+_CURRENT_ENSEMBLE = None  # type: int | None
+
+
+def set_current_ensemble(idx: int | None) -> None:
+    """Set the current ensemble index for logging/debug."""
+    global _CURRENT_ENSEMBLE
+    _CURRENT_ENSEMBLE = idx
+    logger.current_ensemble = idx  # also stash on the shared logger so other modules see it (when model.py calls sim)
+
+
+def get_current_ensemble() -> int | None:  # currently not being used
+    """Get the current ensemble index, or None if not set."""
+    return _CURRENT_ENSEMBLE
+
+
+# +++++++++++++++++++++++ Time context +++++++++++++++++++++++ #
+_TIME_CONTEXT = {
+    "t_start": -1.0,   # seconds
+    "t_end": -1.0,     # seconds
+    "runtime": -1.0,   # total duration in seconds
+}
+
+
+def _reset_time_context() -> None:
+    """Internal helper: clear the time context for a new run."""
+    _TIME_CONTEXT["t_start"] = -1.0
+    _TIME_CONTEXT["t_end"] = -1.0
+    _TIME_CONTEXT["runtime"] = -1.0
+
+
+def get_time_context():  # currently not used
+    """
+    Return a shallow copy of timing information for the last run_ensemble call.
+    """
+    return dict(_TIME_CONTEXT)
+
+
+def get_last_runtime() -> float:
+    """
+    Convenience helper: return runtime (seconds) for the last run_ensemble call,
+    or -1 if run_ensemble has not successfully completed yet.
+    """
+    return _TIME_CONTEXT["runtime"]
+
+
+# +++++++++++++++++++++++ Set up logging +++++++++++++++++++++++ #
+LOGGER_NAME = "pycce-logger"
+logger = logging.getLogger(LOGGER_NAME)
+try:
+    from mpi4py import MPI
+    COMM = MPI.COMM_WORLD
+    RANK = COMM.Get_rank()
+    SIZE = COMM.Get_size()
+except ImportError:
+    COMM = None
+    RANK = 0
+    SIZE = 1
+
+
+def is_root():
+    return RANK == 0
+
+
+def setup_run_logger(run_id, run_dir):
+    """
+    Configure the main logger for this run.
+
+    - Text logs go to <run_dir>/<run_id>.txt (root rank only).
+    - logger.save_csv(tag, header, rows) writes CSVs into the same run_dir.
+    """
+    global logger
+
+    run_dir = Path(run_dir)
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+
+    if is_root():  # only let rank 0 print out so don't get multiple redundant mpi outputs
+        main_log = run_dir / f"output_{run_id}.txt"
+        fh = logging.FileHandler(main_log, mode="w", encoding="utf-8")
+        fh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+        logger.addHandler(fh)
+    else:
+        logger.addHandler(logging.NullHandler())
+
+    # remember context on the logger
+    logger.run_id = run_id
+    logger.run_dir = str(run_dir)
+
+    def save_csv(tag, header, rows, subdir=None, ignore_mpi=False):
+        """
+        Write a CSV named <run_id>_<tag>.csv into the run directory.
+        Only root rank writes. (unless override by ignore_mpi)
+        """
+        if not is_root() and not ignore_mpi:
+            return
+
+        # choose target directory
+        target_dir = run_dir
+        if subdir is not None:
+            target_dir = run_dir / subdir
+            target_dir.mkdir(exist_ok=True)  # safe with MPI, exist_ok=True
+
+        filename = f"{run_id}_{tag}.csv"
+        path = target_dir / filename
+        with path.open("w", newline="") as f:
+            writer = csv.writer(f)
+            if header is not None:
+                writer.writerow(header)
+            writer.writerows(rows)
+
+        logger.info("Wrote CSV %s", filename)
+
+    # attach helper method to the logger object
+    logger.save_csv = save_csv
+
+    return logger
 
 
 # +++++++++++++++++++++++ Auxiliary functions +++++++++++++++++++++++ #
-def make_output_dir(run_id: str, base: str = "output"):
+def get_seed(seed_string):
     """
-    Make output directory for a run: ./output/<run_id>/
-    :param run_id: the run id from the config file
-    :param base: the base output directory, should be ./output/
-    :return: the output directory path as a string
+    Deterministic 32-bit seed from some string.
+    :param seed_string: should be run_id
+    :return: a deterministic seed
     """
-    base_path = Path(base)
-    if not base_path.is_dir():
-        raise RuntimeError(f"Base output directory '{base_path}' does not exist.")
-
-    run_path = base_path / run_id
-    try:
-        run_path.mkdir()  # error if already exists
-    except FileExistsError:
-        raise RuntimeError(
-            f"Run directory '{run_path}' already exists. "
-            "Choose a new run_id or delete/rename the existing folder."
-        )
-    return str(run_path)
+    h = hashlib.blake2b(seed_string.encode("utf-8"), digest_size=8)  # 64 bits
+    return int.from_bytes(h.digest(), "big") & 0xFFFFFFFF
 
 
 def load_config(path):
@@ -42,290 +148,119 @@ def load_config(path):
         cfg = yaml.safe_load(file)
 
     # fix any non-Pythonic yaml variables
-    time_space = cfg["compute_params"].pop("time_space")
-    cfg["compute_params"]["time_space"] = np.linspace(time_space[0], time_space[1], time_space[2])
-
-    # add run_id and base_out_dir to every set of parameters
-    cfg["model_params"]["run_id"] = cfg["run_id"]
-    cfg["simulator_params"]["run_id"] = cfg["run_id"]
-    cfg["compute_params"]["run_id"] = cfg["run_id"]
-    cfg["ensemble_params"]["run_id"] = cfg["run_id"]
-    cfg["model_params"]["base_out_dir"] = cfg["base_out_dir"]
-    cfg["simulator_params"]["base_out_dir"] = cfg["base_out_dir"]
-    cfg["compute_params"]["base_out_dir"] = cfg["base_out_dir"]
-    cfg["ensemble_params"]["base_out_dir"] = cfg["base_out_dir"]
+    time_space = cfg["experiment_params"].pop("time_space")
+    cfg["experiment_params"]["time_space"] = np.linspace(time_space[0], time_space[1], time_space[2])
 
     return cfg
 
 
-def average_ensemble(results, avg_method):
+# +++++++++++++++++++++++ Primary function: run_ensemble +++++++++++++++++++++++ #
+def run_ensemble(config):
     """
-    Expects a dictionary of length 3 of 2D arrays each with shape (num time_steps, ensemble_size), as is the output from
-    the function model.run_ensemble. This will average over the ensemble using the method identified. For now there is
-    just a simple mean and median.
-    :param results: the output of model.run_ensemble
-    :param avg_method: a string identifying the averaging method, straight from the yaml config file
-    :return: [FILL THIS OUT!]
+    Use this method to run experiments. (Rather than calling anything from model.py directly.) Runs many simulations
+    each with a unique bath configuration. A glorified for loop of model.run_experiment. Given a base output directory
+    which already exists (should be './runs/'), creates a new directory in the base output directory named run_id.
+    Outputs a primary text log, primary csv files matching the return dictionary, and optional checkpoint csv files.
+    :param config: see .yaml file for description
+    :return: A dictionary where the keys are cce_types (see .yaml) and the values are 2D arrays having shape
+    (timesteps, ensemble_size). Each column is one experiment and each rows is a time point. Each element is L(t) from
+    0 to 1.
     """
-    if avg_method == "mean":
-        averaged = np.column_stack([np.mean(results[k], axis=-1) if results[k] is not None
-                                    else np.zeros(next(v for v in results.values() if v is not None).shape[0])
-                                    # num time_steps
-                                    for k in ("conv", "gen", "MC")])
-    elif avg_method == "median":
-        averaged = np.column_stack([np.median(results[k], axis=-1) if results[k] is not None
-                                    else np.zeros(next(v for v in results.values() if v is not None).shape[0])
-                                    # num time_steps
-                                    for k in ("conv", "gen", "MC")])
-    else:
-        raise Exception(f"Unknown averaging method")
+    import model  # local import to avoid circular import with model.py
 
-    return averaged
+    # set up configuration
+    run_id = config["run_id"]
+    base_out_dir_str = config["base_out_dir"]
+    ensemble_size = config["ensemble_size"]
+    supercell_params = config["supercell_params"]
+    simulator_params = config["simulator_params"]
+    experiment_params = config["experiment_params"]
 
+    # set up logging / outputs
+    run_dir = Path(base_out_dir_str) / run_id
+    if is_root():  # only root does the mkdir
+        try:
+            run_dir.mkdir()  # makes the output directory
+        except FileExistsError:  # error if already exists
+            msg = (
+                f"Run directory '{run_dir}' already exists. "
+                "Choose a new run_id or delete/rename the existing folder."
+            )
+            logger.error(msg)
+            MPI.COMM_WORLD.Abort(1)
+        except FileNotFoundError:
+            msg = f"Base output directory {base_out_dir_str} not found. This directory should already exist."
+            logger.error(msg)
+            MPI.COMM_WORLD.Abort(1)
+    COMM.Barrier()  # ensure run_dir exists before any rank uses it
+    run_dir = str(run_dir)
+    setup_run_logger(run_id, Path(run_dir))
+    if is_root():
+        logger.info("Initialized output for run %s in %s", run_id, run_dir)
+        logger.info("Config: %s", config)
 
-def fit_curve_basic(results, time_space, cce_type="conv"):
-    """
-    Fit coherence L(t) to the stretched exponential exp(-(t/T2)^p).
-    :param results: L(t)
-    :param time_space: a numpy time space lining up with results
-    :param cce_type: results may include 3 columns corresponding to cce_type, this method only fits one
-    :return: T2 (ms) and p.
-    """
-    # initial guess and bounds
-    p0 = (0.1, 1.5)
-    bounds = ([1e-6, 0.5], [1e6, 3.0])
-
-    def stretch(t, T2, p):
-        return np.exp(- (t / T2) ** p)
-
-    if cce_type == "conv":
-        idx = 0
-    elif cce_type == "gen":
-        idx = 1
-    elif cce_type == "MC":
-        idx = 2
-    else:
-        raise Exception(f"Unknown cce type")
-
-    y = results.T[idx]  # CCE coherence
-    T2, p = curve_fit(stretch, time_space, y, p0=p0, bounds=bounds)[0]
-    return T2, p
-
-
-def plot_coherence_panel(ax, time_space, result, cce_types, title=None, T2=None, p=None, runtime=None, config=None):
-    """
-    Draw a single coherence plot on the given axes.
-    :param ax: axes to plot on
-    :param time_space: numpy time space lining up with results
-    :param result: numpy array with 3 columns, each being L(t) calculated with a different CCE method
-    :param cce_types: the CCE methods used
-    :param title: title of plot
-    :param T2: T2 of the fitted curve
-    :param p: p of the fitted curve
-    :param runtime: how long it took to run
-    :param config: config file, in case want to print more info on the plots
-    :return: nothing
-    """
-    # plot each CCE curve
-    for i, cce_type in enumerate(cce_types):
-        ax.plot(time_space, result[:, i], label=cce_type)
-
-    ax.set_xlabel("Time (ms)")
-    ax.set_ylabel("Coherence")
-
-    if title:
-        ax.set_title(title)
-
-    text_lines = []
-    if config is not None:
-        text_lines.append(f"size = {config['model_params']['size']}, p1_conc = {config['model_params']['p1_conc']}")
-        text_lines.append(f"order = {config['simulator_params']['order']}, r_bath = "
-                          f"{config['simulator_params']['r_bath']}, r_dipole = {config['simulator_params']['r_dipole']}")
-        text_lines.append(f"ensemble = {config['ensemble_params']['ensemble_size']}, magnetic field = "
-                          f"{config['compute_params']['magnetic_field']}")
-    if T2 is not None:
-        text_lines.append(f"Conventional " + r"$\mathbf{T2}$" + f"= {T2:.3g} ms")
-    if p is not None:
-        text_lines.append(f"Conventional " + r"$\mathbf{p}$" + f"= {p:.3g}")
-    if runtime is not None:
-        text_lines.append(r"$\mathbf{runtime}$" + f"= {runtime:.2f} s")
-    if text_lines:
-        ax.text(0.99, 0.85, "\n".join(text_lines), transform=ax.transAxes, va="top", ha="right", fontsize=10)
-    ax.legend()
-
-
-# +++++++++++++++++++++++ Primary functions +++++++++++++++++++++++ #
-def run_coherence_experiment(config, grid_mode=False):
-    """
-    Runs a coherence experiment given some config. Fits the data, averages over the ensemble, and plots the coherence.
-    :param config: see any yaml file for description.
-    :param grid_mode: if running a grid search, will plot onto an ax which will be passed in as grid_mode
-    :return: nothing
-    """
-    run_id = config.pop("run_id")
-    base_out_dir = config.pop(
-        "base_out_dir")  # the dir in which the new output dir associated with this experiment is put
-    run_dir = make_output_dir(run_id, base=base_out_dir)  # string path
-
-    # create output text file
-    out_dir = Path(run_dir)
-    out_file = out_dir / (run_id + ".txt")
-    with out_file.open("x", encoding="utf-8") as f:  # "x" = create, fail if exists
-        f.write("Initialized output text file.\n")
-        f.write(f"\nConfig:{config}.\n")
-
-    # run experiment
+    # initialize time context for this run
+    _reset_time_context()
     t_start = time.time()
-    results = run_ensemble(**config)
-    runtime = time.time() - t_start  # seconds
+    temp_time = t_start  # so we can record how long EACH ensemble run takes
 
-    # put results into csvs
-    time_space = config["compute_params"]["time_space"]
-    for cce_type, arr in results.items():  # recall, arr shape: (num time steps, ensemble_size)
-        if arr is None:
-            continue  # this cce_type wasn't computed
-        data = np.column_stack([time_space, arr])  # first col = time
-        header = "t," + ",".join(f"traj_{i}" for i in range(arr.shape[1]))
-        out_path = out_dir / f"{run_id}_{cce_type}.csv"
-        np.savetxt(out_path, data, delimiter=",", header=header, comments="")
+    # run ensemble of experiments
+    coherence_dict = {cce_type: np.empty((len(experiment_params["time_space"]), ensemble_size))
+                      for cce_type in experiment_params["cce_types"]}
+    base_seed = get_seed(run_id)
+    for i in range(ensemble_size):
+        if is_root():
+            logger.info("Starting ensemble experiment %d", i+1)
+        set_current_ensemble(i+1)  # or i + 1 if you want 1-based
 
-    # average results over the ensemble
-    avg_results = average_ensemble(results, avg_method=config["ensemble_params"]["avg_method"])
-    for i, cce_type in enumerate(config["compute_params"]["cce_types"]):
-        arr = avg_results[:, i]
-        data = np.column_stack([time_space, arr])
-        out_path = out_dir / f"{run_id}_{cce_type}_averaged.csv"
-        header = "t,avg_L"
-        np.savetxt(out_path, data, delimiter=",", header=header, comments="")
+        new_supercell_params = copy.deepcopy(supercell_params)  #  copy so we can tweak per-run
+        new_supercell_params["seed"] = (base_seed + i) & 0xFFFFFFFF  # new seed each loop, deterministic though so
+                                                                     # separate mpi runs will produce the same supercell
 
-    # fit the curve and write to output
-    T2, p = fit_curve_basic(avg_results, time_space, cce_type="conv")
-    with out_file.open("a", encoding="utf-8") as f:
-        f.write("\nResults:\n")
-        f.write(f"\nRuntime:{runtime} s\n")
-        f.write(f"\nConventional T2, p: {T2}, {p}\n")
-        if "gen" in config["compute_params"]["cce_types"]:
-            T2_gen, p_gen = fit_curve_basic(avg_results, time_space, cce_type="gen")
-            f.write(f"\nGeneralized T2, p: {T2_gen}, {p_gen}\n")
-        if "MC" in config["compute_params"]["cce_types"]:
-            T2_mc, p_mc = fit_curve_basic(avg_results, time_space, cce_type="MC")
-            f.write(f"\nGeneralized with MC T2, p: {T2_mc}, {p_mc}\n")
+        supercell = model.get_supercell(new_supercell_params)
+        simulator = model.get_simulator(supercell, simulator_params)
+        coherence = model.run_experiment(simulator, experiment_params)
 
-    # plot the results
-    if not grid_mode:  # normal single experiment
-        fig, ax = plt.subplots(figsize=(12, 8))
-        plot_coherence_panel(ax, time_space=time_space, result=avg_results, config=config,
-                             cce_types=config["compute_params"]["cce_types"], title=run_id, T2=T2, p=p, runtime=runtime)
-        fig.tight_layout()
-        fig.savefig(out_dir / f"{run_id}-plot.png", dpi=300)
-        plt.close(fig)
-    elif isinstance(grid_mode, Axes):  # if running a grid search
-        ax = grid_mode  # grid_mode *is* the Axes
-        plot_coherence_panel(ax, time_space=time_space, result=avg_results, config=config,
-                             cce_types=config["compute_params"]["cce_types"], title=run_id, T2=T2, p=p, runtime=runtime)
-    else:
-        raise Exception(f"grid_mode must be False or a matplotlib Axes object")
+        if set(coherence.keys()) != set(coherence_dict.keys()):
+            raise RuntimeError(f"Mismatch between ensemble cce_types {set(coherence_dict.keys())} and run_experiment "
+                               f"output cce_types {set(coherence.keys())}")
+        for cce_type, traj in coherence.items():
+            coherence_dict[cce_type][:, i] = traj
+        if is_root():
+            logger.info("Rank 0 finished ensemble experiment %d in %.2f s", i+1, time.time() - temp_time)
+            temp_time = time.time()
+    # update time context
+    t_end = time.time()
+    runtime = t_end - t_start  # seconds
+    _TIME_CONTEXT["t_start"] = t_start
+    _TIME_CONTEXT["t_end"] = t_end
+    _TIME_CONTEXT["runtime"] = runtime
+    if is_root():
+        logger.info("Rank 0 finished full ensemble run %s in %.2f s", run_id, runtime)
 
+    # make csv files
+    if is_root():
+        final_csv_dir = Path(run_dir) / "final_csv_files"
+        try:
+            final_csv_dir.mkdir()  # error if already exists
+        except FileExistsError:
+            raise RuntimeError(f"Final CSV directory '{final_csv_dir}' already exists. "
+                               "Choose a new run_id or delete/rename the existing folder.")
+        for cce_type, arr in coherence_dict.items():
+            # each key gives one CSV file: <key>.csv
+            csv_path = final_csv_dir / f"{cce_type}.csv"
+            np.savetxt(csv_path, arr, delimiter=",")
+            logger.info("Wrote final CSV for %s to %s", cce_type, csv_path)
 
-def grid_search(base_config, param1, param2, param1_values, param2_values):
-    """
-    Runs a grid of experiments using the method run_coherence_experiment. Also returns a figure with all results. As of
-    now, does not include a text file with all results. Each experiment has its own output folder, as created by
-    run_coherence_experiment.
-    :param base_config: the base config, see any yaml file
-    :param param1: a list of two strings, the first gives the sub-config (e.g., model_params or compute_params) and the
-    second gives the specific parameter, for instance size or pulse_id.
-    :param param2: same as param1
-    :param param1_values: a list, each element is some value of param1
-    :param param2_values: same as param1
-    :return: nothing
-    """
-    run_id = base_config.pop("run_id")
-    base_out_dir = make_output_dir(run_id)  # string path
-
-    # create output text file
-    out_dir = Path(base_out_dir)
-    out_file = out_dir / (run_id + ".txt")
-    with out_file.open("x", encoding="utf-8") as f:  # "x" = create, fail if exists
-        f.write("Initialized output text file.\n")
-        f.write(f"\nBase config:{base_config}.\n")
-        f.write(f"\nGrid: param1 is {param1}, param2 is {param2}")
-        f.write(f"\nparam1 range is {param1_values}, param2 range is {param2_values}\n\n")
-
-    # initialize grid figure
-    n_rows = len(param1_values)
-    n_cols = len(param2_values)
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4 * n_rows), sharex=True, sharey=True)
-    if n_rows == 1 and n_cols == 1:  # normalize axes to a 2D array so the grid figure works
-        axes = np.array([[axes]])
-    elif n_rows == 1:
-        axes = axes[np.newaxis, :]
-    elif n_cols == 1:
-        axes = axes[:, np.newaxis]
-
-    grid_t_start = time.time()
-    for i, v1 in enumerate(param1_values):
-        for j, v2 in enumerate(param2_values):
-            print(f"\n\n\nstarting grid run: {param1[1]}={v1}, {param2[1]}={v2}")
-
-            # first deep copy the base config
-            grid_run_config = copy.deepcopy(base_config)
-
-            # then set the two parameter values to their grid values
-            grid_run_config[param1[0]][param1[1]] = v1
-            grid_run_config[param2[0]][param2[1]] = v2
-
-            # set things up so output files are put in the correct directories
-            grid_run_id = f"{param1[1]}={v1}--{param2[1]}={v2}"
-            grid_run_config["run_id"] = grid_run_id
-            grid_run_config["base_out_dir"] = base_out_dir
-            grid_run_config["model_params"]["run_id"] = grid_run_id
-            grid_run_config["simulator_params"]["run_id"] = grid_run_id
-            grid_run_config["compute_params"]["run_id"] = grid_run_id
-            grid_run_config["ensemble_params"]["run_id"] = grid_run_id
-            grid_run_config["model_params"]["base_out_dir"] = base_out_dir
-            grid_run_config["simulator_params"]["base_out_dir"] = base_out_dir
-            grid_run_config["compute_params"]["base_out_dir"] = base_out_dir
-            grid_run_config["ensemble_params"]["base_out_dir"] = base_out_dir
-            ax = axes[i, j]
-
-            # run the experiment
-            run_coherence_experiment(grid_run_config, grid_mode=ax)
-            ax.set_title(f"{param1[1]}={v1}, {param2[1]}={v2}")
-            print(f"finished grid run: {param1[1]}={v1}, {param2[1]}={v2}\n\n\n")
-    grid_runtime = time.time() - grid_t_start
-    with out_file.open("a", encoding="utf-8") as f:  # record total grid run time
-        f.write(f"\nTotal grid run time: {grid_runtime}\n")
-
-    # finish the grid plot
-    fig.suptitle(f"Coherence: grid over {param1[1]} and {param2[1]}", fontsize=16)
-    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.96))
-    fig.savefig(out_dir / f"grid_{param1[1]}-{param2[1]}.png", dpi=300)
-    plt.close(fig)
+    return coherence_dict
 
 
-def main(config_path, run_type_id, grid_dict=None):
-    config = load_config(config_path)
-    if run_type_id == "standard":
-        run_coherence_experiment(config)
-    elif run_type_id == "grid":
-        grid_search(config, **grid_dict)
-    else:
-        raise RuntimeError(f"Unknown run type '{run_type_id}'")
+def main(config_path):
+    coherence_dict = run_ensemble(load_config(config_path))
 
 
 if __name__ == '__main__':
-    yaml_path = "config/5.dec.2025_grid-conc-r-dipole.yaml"
-    print(f"Starting run: {yaml_path}\n\n")
-
-    # run_type = "standard"  # "standard" or "grid"
-    # main(yaml_path, run_type)
-
-    run_type = "grid"
-    grid_dict = {
-        "param1": ["model_params", "p1_conc"],
-        "param2": ["simulator_params", "r_dipole"],
-        "param1_values": [0, 2.0e-5, 2.0e-4, 7.0e-3],
-        "param2_values": [4, 10, 20]
-    }
-    main(yaml_path, run_type, grid_dict=grid_dict)
+    if len(sys.argv) < 2:
+        raise SystemExit("Usage: python sim.py <config.yaml>")
+    yaml_path = sys.argv[1]
+    main(yaml_path)
